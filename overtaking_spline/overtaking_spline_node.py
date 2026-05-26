@@ -1,13 +1,3 @@
-"""Thin ROS 2 wrapper for the overtaking_spline planner.
-
-Wires three pieces together:
-- FrenetConverter (updated whenever /pp_path arrives)
-- SplinePlanner (called from the timer at control_loop_frequency)
-- OvertakeFSM (decides whether to actually publish an overtake path/drive)
-
-I/O only -- all algorithmic code lives in frenet.py, spline_planner.py,
-decision.py, follower.py and is unit-tested without ROS.
-"""
 from __future__ import annotations
 
 import time
@@ -15,31 +5,15 @@ from typing import Optional
 
 import numpy as np
 import rclpy
-from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from std_msgs.msg import Float64MultiArray, String
+from std_msgs.msg import Float64MultiArray
 from visualization_msgs.msg import Marker, MarkerArray
 
-from overtaking_spline.decision import (
-    DecisionConfig,
-    DecisionInput,
-    OvertakeFSM,
-    OvertakeState,
-)
-from overtaking_spline.follower import FollowerConfig, pursue
 from overtaking_spline.frenet import FrenetConverter, build_reference_path
 from overtaking_spline.spline_planner import PlannerConfig, SplinePlanner
-
-
-_STATE_IDS = {
-    OvertakeState.FOLLOW: 0,
-    OvertakeState.PLAN_OVERTAKE: 1,
-    OvertakeState.EXECUTE_OVERTAKE: 2,
-    OvertakeState.REMERGE: 3,
-}
 
 
 class OvertakingSplineNode(Node):
@@ -51,10 +25,8 @@ class OvertakingSplineNode(Node):
         self.declare_parameter("odom_topic", "/car_state/odom")
         self.declare_parameter("object_centers_topic", "/object_centers")
         self.declare_parameter("overtake_path_topic", "/overtaking_spline/path")
-        self.declare_parameter("drive_topic", "/overtaking_spline/drive")
         self.declare_parameter("diagnostics_topic", "/overtaking_spline/diagnostics")
         self.declare_parameter("candidates_topic", "/overtaking_spline/candidates")
-        self.declare_parameter("control_selector_topic", "/control_selector")
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("publish_candidates", True)
 
@@ -74,24 +46,8 @@ class OvertakingSplineNode(Node):
         self.declare_parameter("planner.w_offset", 0.5)
         self.declare_parameter("planner.w_bias", 2.0)
 
-        # Decision parameters
-        self.declare_parameter("decision.trigger_distance", 6.0)
-        self.declare_parameter("decision.min_closing_speed", 0.3)
-        self.declare_parameter("decision.clear_distance", 1.5)
-        self.declare_parameter("decision.remerge_lateral", 0.10)
-        self.declare_parameter("decision.plan_to_execute_count", 2)
-        self.declare_parameter("decision.plan_failure_count", 3)
-        self.declare_parameter("decision.abort_distance", 1.0)
-
-        # Follower parameters
-        self.declare_parameter("follower.lookahead", 1.2)
-        self.declare_parameter("follower.wheelbase", 0.33)
-        self.declare_parameter("follower.max_steer", 0.4)
-        self.declare_parameter("follower.speed_scale", 1.0)
-
         # Runtime
         self.declare_parameter("control_loop_frequency", 50.0)
-        self.declare_parameter("only_publish_when_selected", True)
 
         planner_cfg = PlannerConfig(
             car_width=self._p("planner.car_width"),
@@ -109,29 +65,12 @@ class OvertakingSplineNode(Node):
             w_offset=self._p("planner.w_offset"),
             w_bias=self._p("planner.w_bias"),
         )
-        decision_cfg = DecisionConfig(
-            trigger_distance=self._p("decision.trigger_distance"),
-            min_closing_speed=self._p("decision.min_closing_speed"),
-            clear_distance=self._p("decision.clear_distance"),
-            remerge_lateral=self._p("decision.remerge_lateral"),
-            plan_to_execute_count=int(self._p("decision.plan_to_execute_count")),
-            plan_failure_count=int(self._p("decision.plan_failure_count")),
-            abort_distance=self._p("decision.abort_distance"),
-        )
-        self.follower_cfg = FollowerConfig(
-            lookahead=self._p("follower.lookahead"),
-            wheelbase=self._p("follower.wheelbase"),
-            max_steer=self._p("follower.max_steer"),
-            speed_scale=self._p("follower.speed_scale"),
-        )
 
         self.converter = FrenetConverter()
         self.planner = SplinePlanner(self.converter, planner_cfg)
-        self.fsm = OvertakeFSM(config=decision_cfg)
 
         self.frame_id = str(self._p("frame_id"))
         self.publish_candidates = bool(self._p("publish_candidates"))
-        self.only_publish_when_selected = bool(self._p("only_publish_when_selected"))
 
         # Ego state cache
         self.ego_x = 0.0
@@ -143,15 +82,6 @@ class OvertakingSplineNode(Node):
 
         # Opponent: nearest object center to ego (in arc-length forward sense).
         self.opp_xy: Optional[tuple] = None
-        self.opp_xy_prev: Optional[tuple] = None
-        self.opp_xy_prev_t: Optional[float] = None
-        self.opp_vs: float = 0.0  # tracked longitudinal speed in Frenet
-
-        # Last successful plan kept for the executor.
-        self.last_chosen = None
-
-        # Selector state: are we the active controller this tick?
-        self.is_selected = False
 
         # Subscriptions
         self.create_subscription(
@@ -166,17 +96,10 @@ class OvertakingSplineNode(Node):
             MarkerArray, str(self._p("object_centers_topic")),
             self._on_object_centers, 10,
         )
-        self.create_subscription(
-            String, str(self._p("control_selector_topic")),
-            self._on_selector, 10,
-        )
 
         # Publishers
         self.path_pub = self.create_publisher(
             Path, str(self._p("overtake_path_topic")), 10,
-        )
-        self.drive_pub = self.create_publisher(
-            AckermannDriveStamped, str(self._p("drive_topic")), 10,
         )
         self.diag_pub = self.create_publisher(
             Float64MultiArray, str(self._p("diagnostics_topic")), 10,
@@ -191,7 +114,7 @@ class OvertakingSplineNode(Node):
         self.get_logger().info(
             f"overtaking_spline_node up; loop {freq:.1f} Hz, "
             f"track_width={planner_cfg.track_width:.2f}m, "
-            f"trigger={decision_cfg.trigger_distance:.1f}m"
+            f"lookahead={planner_cfg.lookahead:.1f}m"
         )
 
     def _p(self, name: str):
@@ -238,8 +161,7 @@ class OvertakingSplineNode(Node):
             self.opp_xy = None
             return
 
-        # Pick closest by Euclidean distance to ego; matches FSM logic and is
-        # robust to opponents behind us being dropped in the FSM step anyway.
+        # Pick closest by Euclidean distance to ego.
         best = None
         best_d2 = float("inf")
         for m in markers:
@@ -250,46 +172,14 @@ class OvertakingSplineNode(Node):
                 best_d2 = d2
                 best = (m.pose.position.x, m.pose.position.y)
 
-        if best is None:
-            self.opp_xy = None
-            return
-
-        # Track opponent longitudinal speed via Frenet differencing.
-        now = time.monotonic()
-        try:
-            s_now, _, _ = self.converter.cartesian_to_frenet(best[0], best[1])
-        except RuntimeError:
-            self.opp_xy = best
-            return
-
-        if self.opp_xy_prev is not None and self.opp_xy_prev_t is not None:
-            try:
-                s_prev, _, _ = self.converter.cartesian_to_frenet(
-                    self.opp_xy_prev[0], self.opp_xy_prev[1]
-                )
-                dt = now - self.opp_xy_prev_t
-                if 0.02 < dt < 1.0:
-                    ds = self.converter.wrap_delta_s(s_now, s_prev)
-                    # Treat large positive wrap-around (~track length) as no motion.
-                    if ds > self.converter.reference.total_length * 0.5:
-                        ds -= self.converter.reference.total_length
-                    self.opp_vs = 0.8 * self.opp_vs + 0.2 * (ds / dt)
-            except RuntimeError:
-                pass
-
-        self.opp_xy_prev = best
-        self.opp_xy_prev_t = now
         self.opp_xy = best
-
-    def _on_selector(self, msg: String) -> None:
-        self.is_selected = (msg.data == "overtaking_spline")
 
     # -------- main tick --------
 
     def _tick(self) -> None:
         t0 = time.perf_counter()
         if not self.have_ego or not self.converter.ready:
-            self._publish_diag(0.0, 0.0, 0.0, OvertakeState.FOLLOW, 0)
+            self._publish_diag(0.0, 0.0, 0.0, 0)
             return
 
         ego_s, ego_d, _ = self.converter.cartesian_to_frenet(self.ego_x, self.ego_y)
@@ -298,7 +188,6 @@ class OvertakingSplineNode(Node):
         has_opp = self.opp_xy is not None
         ds_to_opp = 0.0
         opp_d = 0.0
-        closing = 0.0
         if has_opp:
             try:
                 opp_s, opp_d, _ = self.converter.cartesian_to_frenet(*self.opp_xy)
@@ -306,15 +195,12 @@ class OvertakingSplineNode(Node):
                 # Map forward-wrap to signed offset so "behind" is negative.
                 if ds_to_opp > self.converter.reference.total_length * 0.5:
                     ds_to_opp -= self.converter.reference.total_length
-                closing = ego_speed_long - self.opp_vs
             except RuntimeError:
                 has_opp = False
 
         t_plan_start = time.perf_counter()
         plan = None
-        if has_opp and 0.0 < ds_to_opp <= max(
-            self.fsm.config.trigger_distance, self.planner.config.lookahead
-        ):
+        if has_opp and 0.0 < ds_to_opp <= self.planner.config.lookahead:
             plan = self.planner.plan(
                 ego_s=ego_s, ego_d=ego_d,
                 opp_s=ego_s + ds_to_opp, opp_d=opp_d,
@@ -322,40 +208,18 @@ class OvertakingSplineNode(Node):
             )
         t_plan = (time.perf_counter() - t_plan_start) * 1e3
 
-        plan_feasible = bool(plan is not None and plan.chosen is not None)
+        chosen = plan.chosen if plan is not None else None
 
-        decision = self.fsm.step(DecisionInput(
-            has_opponent=has_opp,
-            ds_to_opponent=ds_to_opp,
-            opp_d=opp_d,
-            ego_d=ego_d,
-            closing_speed=closing,
-            plan_feasible=plan_feasible,
-        ))
-
-        if plan_feasible:
-            self.last_chosen = plan.chosen
-
-        if decision.publish_overtake_path and self.last_chosen is not None:
-            self._publish_path(self.last_chosen)
-            if not self.only_publish_when_selected or self.is_selected:
-                self._publish_drive(self.last_chosen)
+        if chosen is not None:
+            self._publish_path(chosen)
 
         if self.publish_candidates and plan is not None:
             self._publish_candidates(plan.candidates,
-                                     getattr(plan.chosen, "d_target", None))
+                                     getattr(chosen, "d_target", None))
 
         total_ms = (time.perf_counter() - t0) * 1e3
-        side = 0 if self.last_chosen is None else int(np.sign(self.last_chosen.d_target))
-        self._publish_diag(t_plan, total_ms, ego_speed_long, decision.state, side)
-
-        if decision.reason not in ("follow", "executing", "planning"):
-            self.get_logger().info(
-                f"state={decision.state.value} reason={decision.reason} "
-                f"ds_to_opp={ds_to_opp:.2f} closing={closing:.2f} "
-                f"plan_ms={t_plan:.2f} total_ms={total_ms:.2f}",
-                throttle_duration_sec=0.5,
-            )
+        side = 0 if chosen is None else int(np.sign(chosen.d_target))
+        self._publish_diag(t_plan, total_ms, ego_speed_long, side)
 
     # -------- publishers --------
 
@@ -374,19 +238,6 @@ class OvertakingSplineNode(Node):
             p.pose.orientation.w = float(v)
             msg.poses.append(p)
         self.path_pub.publish(msg)
-
-    def _publish_drive(self, chosen) -> None:
-        vs = self.converter.velocity_at_batch(chosen.s_samples)
-        steer, speed = pursue(
-            self.ego_x, self.ego_y, self.ego_yaw,
-            chosen.xs, chosen.ys, vs, self.follower_cfg,
-        )
-        msg = AckermannDriveStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.drive.steering_angle = steer
-        msg.drive.speed = speed
-        self.drive_pub.publish(msg)
 
     def _publish_candidates(self, candidates, chosen_d_target) -> None:
         arr = MarkerArray()
@@ -419,13 +270,12 @@ class OvertakingSplineNode(Node):
         self.candidates_pub.publish(arr)
 
     def _publish_diag(self, plan_ms: float, total_ms: float, ego_speed: float,
-                      state: OvertakeState, side: int) -> None:
+                      side: int) -> None:
         msg = Float64MultiArray()
         msg.data = [
             float(plan_ms),
             float(total_ms),
             float(ego_speed),
-            float(_STATE_IDS[state]),
             float(side),
         ]
         self.diag_pub.publish(msg)
