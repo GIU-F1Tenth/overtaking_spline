@@ -5,13 +5,10 @@ overtaking_spline_node:
     odom_topic: "/car_state/odom"             # nav_msgs/Odometry, sensor QoS
     object_centers_topic: "/object_centers"   # visualization_msgs/MarkerArray (skips [0] DELETEALL)
     overtake_path_topic: "/overtaking_spline/path"
-    drive_topic: "/overtaking_spline/drive"
-    diagnostics_topic: "/overtaking_spline/diagnostics"   # Float64MultiArray: [plan_ms, total_ms, ego_speed, state_id, side]
+    diagnostics_topic: "/overtaking_spline/diagnostics"   # Float64MultiArray: [plan_ms, total_ms, ego_speed, side]
     candidates_topic: "/overtaking_spline/candidates"     # debug viz, can be disabled
-    control_selector_topic: "/control_selector"
     frame_id: "map"
     publish_candidates: true
-    only_publish_when_selected: true  # if true, drive is only published while FSM picks us
 
     # ---------- Planner ----------
     planner:
@@ -29,23 +26,6 @@ overtaking_spline_node:
       w_curvature: 1.0
       w_offset: 0.5
       w_bias: 2.0
-
-    # ---------- Decision FSM ----------
-    decision:
-      trigger_distance: 6.0        # opponent must be within this arc-length to trigger [m]
-      min_closing_speed: 0.3       # ego_v - opp_v [m/s]
-      clear_distance: 1.5          # opp behind by this much -> remerge [m]
-      remerge_lateral: 0.10        # |d| under which remerge is considered done [m]
-      plan_to_execute_count: 2     # consecutive feasible plans needed to commit
-      plan_failure_count: 3        # consecutive failures before bailing
-      abort_distance: 1.0          # opponent lateral abort threshold
-
-    # ---------- Follower (pure pursuit on the generated path) ----------
-    follower:
-      lookahead: 1.2
-      wheelbase: 0.33
-      max_steer: 0.4
-      speed_scale: 1.0
 
     # ---------- Runtime ----------
     control_loop_frequency: 50.0
