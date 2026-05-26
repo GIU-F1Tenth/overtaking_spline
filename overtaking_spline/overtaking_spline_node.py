@@ -29,6 +29,7 @@ class OvertakingSplineNode(Node):
         self.declare_parameter("candidates_topic", "/overtaking_spline/candidates")
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("publish_candidates", True)
+        self.declare_parameter("publish_diagnostics", True)
 
         # Planner parameters
         self.declare_parameter("planner.car_width", 0.30)
@@ -71,7 +72,8 @@ class OvertakingSplineNode(Node):
 
         self.frame_id = str(self._p("frame_id"))
         self.publish_candidates = bool(self._p("publish_candidates"))
-
+        self.publish_diagnostics = bool(self._p("publish_diagnostics"))
+        
         # Ego state cache
         self.ego_x = 0.0
         self.ego_y = 0.0
@@ -219,7 +221,9 @@ class OvertakingSplineNode(Node):
 
         total_ms = (time.perf_counter() - t0) * 1e3
         side = 0 if chosen is None else int(np.sign(chosen.d_target))
-        self._publish_diag(t_plan, total_ms, ego_speed_long, side)
+        
+        if self.publish_diagnostics:
+            self._publish_diag(t_plan, total_ms, ego_speed_long, side)
 
     # -------- publishers --------
 

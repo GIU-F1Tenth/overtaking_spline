@@ -9,6 +9,7 @@ overtaking_spline_node:
     candidates_topic: "/overtaking_spline/candidates"     # debug viz, can be disabled
     frame_id: "map"
     publish_candidates: true
+    publish_diagnostics: false
 
     # ---------- Planner ----------
     planner:
