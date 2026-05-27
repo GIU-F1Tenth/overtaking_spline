@@ -245,7 +245,7 @@ class SplinePlanner:
         if not feasible_cands:
             return PlanResult(None, candidates, 0, "no_feasible_candidate")
 
-        chosen = min(feasible_cands, key=lambda c: c.cost)
+        chosen = sorted(feasible_cands, key=lambda c: c.cost)[len(feasible_cands) // 2]
         side = int(np.sign(chosen.d_target)) if chosen.d_target != 0 else 0
         return PlanResult(chosen, candidates, side, "ok")
 
