@@ -17,13 +17,15 @@ from overtaking_spline.spline_planner import PlannerConfig, SplinePlanner
 
 
 class OvertakingSplineNode(Node):
+    VELOCITY_ARROW_DT = 0.5
+
     def __init__(self) -> None:
         super().__init__("overtaking_spline_node")
 
         # Topic parameters
         self.declare_parameter("reference_path_topic", "/pp_path")
         self.declare_parameter("odom_topic", "/car_state/odom")
-        self.declare_parameter("object_centers_topic", "/object_centers")
+        self.declare_parameter("object_velocities_topic", "/object_velocities")
         self.declare_parameter("overtake_path_topic", "/overtaking_spline/path")
         self.declare_parameter("diagnostics_topic", "/overtaking_spline/diagnostics")
         self.declare_parameter("candidates_topic", "/overtaking_spline/candidates")
@@ -82,8 +84,7 @@ class OvertakingSplineNode(Node):
         self.ego_vy = 0.0
         self.have_ego = False
 
-        # Opponent: nearest object center to ego (in arc-length forward sense).
-        self.opp_xy: Optional[tuple] = None
+        self.opp_state: Optional[tuple] = None
 
         # Subscriptions
         self.create_subscription(
@@ -95,8 +96,8 @@ class OvertakingSplineNode(Node):
             self._on_odom, qos_profile_sensor_data,
         )
         self.create_subscription(
-            MarkerArray, str(self._p("object_centers_topic")),
-            self._on_object_centers, 10,
+            MarkerArray, str(self._p("object_velocities_topic")),
+            self._on_object_velocities, 10,
         )
 
         # Publishers
@@ -155,26 +156,31 @@ class OvertakingSplineNode(Node):
         ))
         self.have_ego = True
 
-    def _on_object_centers(self, msg: MarkerArray) -> None:
-        # detection_node.publish_markers() prepends a DELETEALL marker, skip it.
-        markers = [m for m in msg.markers[1:]
-                   if m.action == Marker.ADD and m.ns == "object_centers"]
-        if not markers or not self.have_ego or not self.converter.ready:
-            self.opp_xy = None
+
+    def _on_object_velocities(self, msg: MarkerArray) -> None:
+        arrows = [
+            m for m in msg.markers
+            if m.action == Marker.ADD and m.ns == "velocities"
+            and m.type == Marker.ARROW and len(m.points) >= 2
+        ]
+        if not arrows or not self.have_ego or not self.converter.ready:
+            self.opp_state = None
             return
 
-        # Pick closest by Euclidean distance to ego.
         best = None
         best_d2 = float("inf")
-        for m in markers:
-            dx = m.pose.position.x - self.ego_x
-            dy = m.pose.position.y - self.ego_y
+        for m in arrows:
+            start, end = m.points[0], m.points[1]
+            dx = start.x - self.ego_x
+            dy = start.y - self.ego_y
             d2 = dx * dx + dy * dy
             if d2 < best_d2:
                 best_d2 = d2
-                best = (m.pose.position.x, m.pose.position.y)
+                vx = (end.x - start.x) / self.VELOCITY_ARROW_DT
+                vy = (end.y - start.y) / self.VELOCITY_ARROW_DT
+                best = (start.x, start.y, vx, vy)
 
-        self.opp_xy = best
+        self.opp_state = best
 
     # -------- main tick --------
 
@@ -187,16 +193,31 @@ class OvertakingSplineNode(Node):
         ego_s, ego_d, _ = self.converter.cartesian_to_frenet(self.ego_x, self.ego_y)
         ego_speed_long = float(np.hypot(self.ego_vx, self.ego_vy))
 
-        has_opp = self.opp_xy is not None
+        has_opp = self.opp_state is not None
         ds_to_opp = 0.0
         opp_d = 0.0
+        opp_vs = 0.0
+        opp_vd = 0.0
         if has_opp:
             try:
-                opp_s, opp_d, _ = self.converter.cartesian_to_frenet(*self.opp_xy)
+                opp_x, opp_y, opp_vx, opp_vy = self.opp_state
+                opp_s, opp_d, _ = self.converter.cartesian_to_frenet(opp_x, opp_y)
                 ds_to_opp = self.converter.wrap_delta_s(opp_s, ego_s)
                 # Map forward-wrap to signed offset so "behind" is negative.
                 if ds_to_opp > self.converter.reference.total_length * 0.5:
                     ds_to_opp -= self.converter.reference.total_length
+
+                eps = 1e-2
+                x0, y0 = self.converter.frenet_to_cartesian(opp_s, 0.0)
+                x1, y1 = self.converter.frenet_to_cartesian(opp_s + eps, 0.0)
+                tx, ty = x1 - x0, y1 - y0
+                n = (tx * tx + ty * ty) ** 0.5
+                if n > 0.0:
+                    tx /= n
+                    ty /= n
+                    nx, ny = -ty, tx
+                    opp_vs = opp_vx * tx + opp_vy * ty
+                    opp_vd = opp_vx * nx + opp_vy * ny
             except RuntimeError:
                 has_opp = False
 
@@ -207,6 +228,7 @@ class OvertakingSplineNode(Node):
                 ego_s=ego_s, ego_d=ego_d,
                 opp_s=ego_s + ds_to_opp, opp_d=opp_d,
                 ego_speed=ego_speed_long,
+                opp_vs=opp_vs, opp_vd=opp_vd,
             )
         t_plan = (time.perf_counter() - t_plan_start) * 1e3
 
