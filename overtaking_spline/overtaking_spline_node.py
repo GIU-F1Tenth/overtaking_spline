@@ -253,16 +253,50 @@ class OvertakingSplineNode(Node):
         msg = Path()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
-        # Decorate each pose with the reference velocity at that arc-length
-        # so downstream pure-pursuit reads orientation.w just like /pp_path.
-        vs = self.converter.velocity_at_batch(chosen.s_samples)
-        for x, y, v in zip(chosen.xs, chosen.ys, vs):
+
+        ref = self.converter.reference
+        total = ref.total_length
+
+        # Overtake spans [s_samples[0], s_samples[-1]] in absolute arc-length;
+        # wrap to the reference's [0, total) domain to slice it cleanly.
+        s_raw_start = float(chosen.s_samples[0])
+        s_raw_end = float(chosen.s_samples[-1])
+        if total > 0:
+            s_start = s_raw_start % total
+            s_end = s_raw_end % total
+            wraps = (s_raw_end - s_raw_start) >= total or s_end < s_start
+        else:
+            s_start, s_end = s_raw_start, s_raw_end
+            wraps = False
+
+        overtake_vs = self.converter.velocity_at_batch(chosen.s_samples)
+
+        def append_pose(x: float, y: float, v: float) -> None:
             p = PoseStamped()
             p.header.frame_id = self.frame_id
             p.pose.position.x = float(x)
             p.pose.position.y = float(y)
             p.pose.orientation.w = float(v)
             msg.poses.append(p)
+
+        def append_ref_range(mask: np.ndarray) -> None:
+            for i in np.flatnonzero(mask):
+                append_pose(ref.x[i], ref.y[i], ref.v[i])
+
+        def append_overtake() -> None:
+            for x, y, v in zip(chosen.xs, chosen.ys, overtake_vs):
+                append_pose(x, y, v)
+
+        if not wraps:
+            # ref [0, s_start) + overtake + ref (s_end, total]
+            append_ref_range(ref.s < s_start)
+            append_overtake()
+            append_ref_range(ref.s > s_end)
+        else:
+            # Overtake crosses the loop seam: ref (s_end, s_start) + overtake.
+            append_ref_range((ref.s > s_end) & (ref.s < s_start))
+            append_overtake()
+
         self.path_pub.publish(msg)
 
     def _publish_candidates(self, candidates, chosen_d_target) -> None:
