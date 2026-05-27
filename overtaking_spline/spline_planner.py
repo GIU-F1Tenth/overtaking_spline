@@ -131,15 +131,33 @@ class SplinePlanner:
              ego_s: float, ego_d: float,
              opp_s: float, opp_d: float,
              ego_speed: float,
+             opp_vs: float = 0.0,
+             opp_vd: float = 0.0,
              ) -> PlanResult:
         cfg = self.config
         usable = cfg.usable_half_width()
         if usable <= 0:
             return PlanResult(None, [], 0, "no_drivable_width")
 
-        # Maneuver longitudinal window: start at ego, end past the opponent.
-        ds_to_opp = self.converter.wrap_delta_s(opp_s, ego_s)
-        L = max(cfg.lookahead, ds_to_opp + cfg.rejoin_distance)
+        # Speed for feasibility check, with a floor to avoid divide-by-zero.
+        v_check = max(ego_speed, 0.5)
+
+        # Predict where the ego actually meets the opponent. With a moving
+        # opponent, the catch-up distance is (v_opp * t_enc) longer than the
+        # instantaneous gap. If the opponent is as fast or faster than the
+        # ego along s, freeze the prediction (t_enc = 0) rather than
+        # extrapolating to infinity.
+        ds_to_opp_now = self.converter.wrap_delta_s(opp_s, ego_s)
+        closing = v_check - opp_vs
+        if closing > 1e-3:
+            t_encounter = max(ds_to_opp_now, 0.0) / closing
+        else:
+            t_encounter = 0.0
+        ds_to_pass = ds_to_opp_now + opp_vs * t_encounter
+
+        # Maneuver longitudinal window: start at ego, end past the *predicted*
+        # opponent pass point so we never plan a rejoin behind a moving target.
+        L = max(cfg.lookahead, ds_to_pass + cfg.rejoin_distance)
         s0 = ego_s
 
         # Candidate target offsets: spread across the usable band, pruned to feasible.
@@ -158,19 +176,24 @@ class SplinePlanner:
         # slightly off-line at s0, the candidate naturally transitions from
         # ego_d to d_target without artifacts.
 
-        # Speed for feasibility check, with a floor to avoid divide-by-zero.
-        v_check = max(ego_speed, 0.5)
         kappa_max_allowed = cfg.max_lateral_acc / (v_check * v_check)
 
         u_samples = np.linspace(0.0, L, cfg.n_samples)
         # The Frenet "s" of each sample.
         s_samples_abs = s0 + u_samples
 
+        # Per-sample arrival time along the spline. Predict the opponent's
+        # Frenet pose at the moment the ego is at each sample so clearance
+        # is evaluated in space-time alignment, not against a stale snapshot.
+        t_arrival = u_samples / v_check
+        opp_s_pred = opp_s + opp_vs * t_arrival
+        opp_d_pred = opp_d + opp_vd * t_arrival
+
         # Two-segment design: branch quintic from ego state to (d_target, 0, 0)
-        # at u_peak (placed near the opponent), then rejoin quintic from
-        # (d_target, 0, 0) to (0, 0, 0) at u = L. Both segments are C^2 at
-        # the seam by construction since the seam conditions match.
-        u_peak = float(np.clip(ds_to_opp, 0.25 * L, 0.75 * L))
+        # at u_peak (placed where ego meets the *predicted* opponent), then
+        # rejoin quintic from (d_target, 0, 0) to (0, 0, 0) at u = L. Both
+        # segments are C^2 at the seam by construction.
+        u_peak = float(np.clip(ds_to_pass, 0.25 * L, 0.75 * L))
         L_branch = u_peak
         L_rejoin = L - u_peak
 
@@ -207,12 +230,16 @@ class SplinePlanner:
             max_kappa = float(np.max(kappa))
             feasible_curv = max_kappa <= kappa_max_allowed
 
-            # Clearance to opponent: minimum |d(s) - opp_d| within ±1m of opp_s.
-            window = np.abs(self._sample_arc_offset(s_samples_abs, opp_s)) <= 1.0
+            # Clearance to opponent at matching arrival times: window contains
+            # samples whose ego s is within ±1m of the opponent's predicted s
+            # at that same time; clearance is then the lateral gap to the
+            # opponent's predicted d at those times.
+            s_gap = self._sample_arc_offset(s_samples_abs, opp_s_pred)
+            window = np.abs(s_gap) <= 1.0
             if np.any(window):
-                clearance = float(np.min(np.abs(d_samples[window] - opp_d)))
+                clearance = float(np.min(np.abs(d_samples[window] - opp_d_pred[window])))
             else:
-                clearance = float(np.min(np.abs(d_samples - opp_d)))
+                clearance = float(np.min(np.abs(d_samples - opp_d_pred)))
 
             opponent_blocked = clearance < (cfg.car_width / 2.0 + cfg.safety_margin)
             feasible = within_corridor and feasible_curv and not opponent_blocked
@@ -249,8 +276,13 @@ class SplinePlanner:
         side = int(np.sign(chosen.d_target)) if chosen.d_target != 0 else 0
         return PlanResult(chosen, candidates, side, "ok")
 
-    def _sample_arc_offset(self, s_samples_abs: np.ndarray, s_ref: float) -> np.ndarray:
-        """Signed shortest arc-length offset for each sample relative to s_ref."""
+    def _sample_arc_offset(self, s_samples_abs: np.ndarray,
+                           s_ref: "float | np.ndarray") -> np.ndarray:
+        """Signed shortest arc-length offset for each sample relative to s_ref.
+
+        s_ref may be a scalar or an array of matching shape (per-sample
+        reference, e.g. a moving obstacle's predicted s at each arrival time).
+        """
         ref = self.converter.reference
         if ref is None or ref.total_length <= 0:
             return s_samples_abs - s_ref
